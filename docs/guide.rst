@@ -1606,7 +1606,10 @@ Storage Options
     readiness through a blocking pop on a dedicated result list. By default
     this result-readiness list will expire after 60 seconds, but this can be
     controlled with the ``notify_result_ttl`` parameter. **All RedisHuey**
-    implementations support these options.
+    implementations support these options. The result write and readiness
+    notification are atomic and tracked in an outbox; a consumer reconciles
+    pending notifications when it starts, so interrupting a writer cannot
+    leave callers blocked past their timeout for a result that already exists.
 
     Task priorities are not supported by :py:class:`RedisHuey`.
 

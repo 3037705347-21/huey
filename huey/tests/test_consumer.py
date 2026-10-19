@@ -42,6 +42,20 @@ class TestConsumerIntegration(BaseTestCase):
             result = task_a(1)
             self.assertEqual(result.get(blocking=True, timeout=2), 2)
 
+    def test_consumer_restores_pending_notifications_on_start(self):
+        # A consumer converges orphaned result notifications at startup.
+        calls = []
+        original = self.huey.restore_result_notifications
+
+        def restore():
+            calls.append(original())
+            return calls[-1]
+
+        self.huey.restore_result_notifications = restore
+        with self.consumer_context():
+            pass
+        self.assertEqual(calls, [0])
+
     def work_on_tasks(self, consumer, n=1, now=None):
         worker, _ = consumer.worker_threads[0]
         for i in range(n):

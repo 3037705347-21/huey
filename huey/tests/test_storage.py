@@ -196,6 +196,10 @@ class StorageTests(object):
         self.s.put_data(key, b'v1', is_result=True)
         self.assertTrue(self.s.wait_result(key, timeout=1))
 
+    def test_restore_notifications_noop(self):
+        # Backends without result notification support have nothing pending.
+        self.assertEqual(self.s.restore_result_notifications(), 0)
+
     def test_priority(self):
         if not self.s.priority:
             raise unittest.SkipTest('priority support required')
@@ -334,30 +338,203 @@ class TestRedisStorage(StorageTests, BaseTestCase):
         self.assertEqual(self.s.pop_data(b'k1'), b'')
 
 
-class TestRedisStorageWaitResult(TestRedisStorage):
-    def get_huey(self):
-        return RedisHuey(utc=False, notify_result=True, notify_result_ttl=30)
+class WaitResultNotifyTests(object):
+    """Tests for storages configured with notify_result=True. Shared by the
+    hash-backed and per-key-expiring Redis storages."""
+    notify_ttl = 30
 
-    def test_notify_ttl(self):
-        key = str(uuid.uuid4())
-        self.s.put_data(key, b'v1', is_result=True)
-        ttl = self.s.conn.ttl(self.s.notify_prefix + key)
-        self.assertTrue(0 < ttl <= 30)
-        self.s.pop_data(key)
-        self.assertTrue(self.s.wait_result(key, timeout=1))
-        self.assertFalse(self.s.conn.exists(self.s.notify_prefix + key))
+    def _new_key(self):
+        return str(uuid.uuid4())
 
-    def test_wait_result_multiple_waiters(self):
-        key = str(uuid.uuid4())
+    def _notify_len(self, key):
+        return self.s.conn.llen(self.s._notify_key(key))
+
+    def _orphan_result(self, key):
+        # Simulate a writer that was interrupted with the result stored and
+        # the outbox entry recorded, but whose ready-token was lost.
+        self.s.conn.sadd(self.s.outbox_key, key)
+
+    def _blocked_waiter(self, key, timeout=2):
         q = Queue()
         def waiter():
-            q.put(self.s.wait_result(key, timeout=2))
-        threads = [threading.Thread(target=waiter) for _ in range(2)]
+            start = time.monotonic()
+            q.put((self.s.wait_result(key, timeout=timeout),
+                   round(time.monotonic() - start, 2)))
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.2)  # Let the waiter enter BLPOP.
+        return q, t
+
+    def test_notify_ttl(self):
+        key = self._new_key()
+        nkey = self.s._notify_key(key)
+        self.s.put_data(key, b'v1', is_result=True)
+        self.assertTrue(0 < self.s.conn.ttl(nkey) <= self.notify_ttl)
+        # The outbox records the notification until it settles.
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key),
+                         {key.encode('utf8')})
+
+    def test_wait_result_preexisting(self):
+        # A result already stored when waiting begins returns immediately,
+        # even if the ready-token was never armed.
+        key = self._new_key()
+        self.s.put_data(key, b'v1', is_result=True)
+        self.assertTrue(self.s.wait_result(key, timeout=1))
+
+    def test_wait_result_blocked_settles(self):
+        key = self._new_key()
+        q, t = self._blocked_waiter(key)
+        self.s.put_data(key, b'v1', is_result=True)
+        t.join()
+        ready, elapsed = q.get()
+        self.assertTrue(ready)
+        self.assertLess(elapsed, 1)  # Woken promptly, not at the timeout.
+        # Confirmed waiter settles the outbox, leaving one relayed token (no
+        # peers to hand it to) with the TTL refreshed.
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+        self.assertEqual(self._notify_len(key), 1)
+        nkey = self.s._notify_key(key)
+        self.assertTrue(0 < self.s.conn.ttl(nkey) <= self.notify_ttl)
+
+    def test_wait_result_multiple_waiters(self):
+        key = self._new_key()
+        q = Queue()
+        def waiter():
+            start = time.monotonic()
+            q.put((self.s.wait_result(key, timeout=2),
+                   round(time.monotonic() - start, 2)))
+        threads = [threading.Thread(target=waiter) for _ in range(3)]
         for t in threads: t.start()
         time.sleep(0.2)
         self.s.put_data(key, b'v1', is_result=True)
         for t in threads: t.join()
-        self.assertEqual([q.get(), q.get()], [True, True])
+        results = sorted(q.get() for _ in threads)
+        self.assertEqual([r for r, _ in results], [True, True, True])
+        # Every waiter is woken promptly via the token relay, rather than one
+        # waiter consuming the only token and the rest blocking to timeout.
+        self.assertTrue(all(elapsed < 1 for _, elapsed in results), results)
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+        self.assertLessEqual(self._notify_len(key), 1)
+
+    def test_duplicate_put_does_not_duplicate_token(self):
+        key = self._new_key()
+        self.s.put_data(key, b'v1', is_result=True)
+        self.s.put_data(key, b'v2', is_result=True)
+        self.assertEqual(self.peek_value(key), b'v2')
+        self.assertEqual(self._notify_len(key), 1)
+
+    def test_non_result_data_does_not_notify(self):
+        key = self._new_key()
+        # A waiter blocked before the write happens is not woken: non-result
+        # data pushes no ready-token, so it only unblocks at its timeout.
+        q, t = self._blocked_waiter(key, timeout=0.5)
+        self.s.put_data(key, b'metadata')
+        time.sleep(0.2)
+        self.assertTrue(q.empty())  # Still blocked: no token was pushed.
+        t.join()
+        self.assertFalse(self.s.conn.exists(self.s._notify_key(key)))
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+        # put_if_empty (locks/semaphores) must not notify either.
+        self.assertTrue(self.s.put_if_empty(self._new_key(), b'v'))
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+
+    def test_stale_token_does_not_fake_readiness(self):
+        key = self._new_key()
+        self.s.put_data(key, b'v1', is_result=True)
+        self.assertTrue(self.s.delete_data(key))  # Retires token + outbox.
+        self.assertFalse(self.s.conn.exists(self.s._notify_key(key)))
+        # A stale/duplicate token arriving after the result is gone must not
+        # make wait_result report readiness: the token is re-validated.
+        self.s.conn.lpush(self.s._notify_key(key), b'1')
+        self.assertFalse(self.s.wait_result(key, timeout=0.4))
+        # A fresh result write arms a proper token and wakes again.
+        self.s.put_data(key, b'v2', is_result=True)
+        self.assertTrue(self.s.wait_result(key, timeout=1))
+        self.assertEqual(self.peek_value(key), b'v2')
+
+    def test_restore_wakes_blocked_waiter(self):
+        key = self._new_key()
+        self.write_result_raw(key, b'v1')
+        self._orphan_result(key)
+        q, t = self._blocked_waiter(key, timeout=3)
+        self.assertEqual(self.s.restore_result_notifications(), 1)
+        t.join()
+        ready, elapsed = q.get()
+        self.assertTrue(ready)
+        self.assertLess(elapsed, 1)
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+        self.assertEqual(self.peek_value(key), b'v1')
+
+    def test_restore_is_idempotent(self):
+        key = self._new_key()
+        self.write_result_raw(key, b'orig')
+        self._orphan_result(key)
+        self.assertEqual(self.s.restore_result_notifications(), 1)
+        # A second run has nothing pending and creates no duplicate token.
+        self.assertEqual(self.s.restore_result_notifications(), 0)
+        self.assertEqual(self._notify_len(key), 1)
+        # Recovery never rewrites the stored result.
+        self.assertEqual(self.peek_value(key), b'orig')
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+
+    def test_restore_missing_result_does_not_notify(self):
+        key = self._new_key()
+        self._orphan_result(key)
+        self.assertEqual(self.s.restore_result_notifications(), 1)
+        self.assertFalse(self.s.conn.exists(self.s._notify_key(key)))
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+        self.assertFalse(self.s.wait_result(key, timeout=0.2))
+
+    def test_delete_retires_token(self):
+        key = self._new_key()
+        self.s.put_data(key, b'v1', is_result=True)
+        self.assertTrue(self.s.conn.exists(self.s._notify_key(key)))
+        self.assertTrue(self.s.delete_data(key))
+        self.assertFalse(self.s.conn.exists(self.s._notify_key(key)))
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+        self.assertFalse(self.s.wait_result(key, timeout=0.2))
+
+
+@requires_redis
+class TestRedisStorageWaitResult(WaitResultNotifyTests, TestRedisStorage):
+    def get_huey(self):
+        return RedisHuey(utc=False, notify_result=True,
+                         notify_result_ttl=self.notify_ttl)
+
+    def peek_value(self, key):
+        return self.s.peek_data(key)
+
+    def write_result_raw(self, key, value):
+        self.s.conn.hset(self.s.result_key, key, value)
+
+    def test_pop_retires_token(self):
+        key = str(uuid.uuid4())
+        self.s.put_data(key, b'v1', is_result=True)
+        nkey = self.s._notify_key(key)
+        self.assertTrue(0 < self.s.conn.ttl(nkey) <= self.notify_ttl)
+        self.assertEqual(self.s.pop_data(key), b'v1')
+        # Consuming the result settles the outbox and retires the token, so a
+        # later waiter is not woken for a result that no longer exists.
+        self.assertFalse(self.s.conn.exists(nkey))
+        self.assertEqual(self.s.conn.smembers(self.s.outbox_key), set())
+        self.assertFalse(self.s.wait_result(key, timeout=0.2))
+
+
+@requires_redis
+class TestRedisExpireStorageWaitResult(WaitResultNotifyTests, StorageTests,
+                                      BaseTestCase):
+    destructive_reads = False
+
+    def get_huey(self):
+        return RedisExpireHuey(expire_time=3600, utc=False, blocking=False,
+                               notify_result=True,
+                               notify_result_ttl=self.notify_ttl)
+
+    def peek_value(self, key):
+        return self.s.peek_data(key)
+
+    def write_result_raw(self, key, value):
+        self.s.conn.set(self.s.result_key(key), value, ex=3600)
 
 
 @requires_redis

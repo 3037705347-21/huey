@@ -465,6 +465,14 @@ class Consumer(object):
 
         self._logger.info('\n'.join(msg))
 
+        # Complete any result-ready notifications orphaned by a consumer
+        # process that was interrupted mid-write, so waiters of those results
+        # are woken instead of blocking until their timeout.
+        restored = self.huey.restore_result_notifications()
+        if restored:
+            self._logger.info('Restored %s pending result notification(s).',
+                              restored)
+
         # Start the scheduler and workers.
         self.scheduler.start()
         for _, worker_process in self.worker_threads:

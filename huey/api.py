@@ -285,6 +285,16 @@ class Huey(object):
                 break  # Task might have raced and finished.
             self._emit(S.SIGNAL_INTERRUPTED, task)
 
+    def restore_result_notifications(self):
+        """
+        Converge result-ready notifications that were left pending when a
+        previous writer/consumer process was interrupted. Existing results
+        re-arm their notification (waking any blocked waiters), while missing
+        results and repeated runs produce no extra notification. Returns the
+        number of pending notifications examined.
+        """
+        return self.storage.restore_result_notifications()
+
     def signal(self, *signals):
         def decorator(fn):
             self._signal.connect(fn, *signals)

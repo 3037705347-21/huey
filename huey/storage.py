@@ -215,6 +215,18 @@ class BaseStorage(object):
             time.sleep(min(delay, max_delay))
             delay *= backoff
 
+    def restore_result_notifications(self):
+        """
+        Complete any result-ready notifications that were left pending when a
+        previous writer/consumer was interrupted. Results that still exist
+        must re-arm their notification (waking any waiters), and the operation
+        must be idempotent: no duplicate notifications and no result rewrites.
+
+        :return: Number of pending notifications examined. Backends without
+                 result notification support return 0.
+        """
+        return 0
+
     def delete_data(self, key):
         """
         Delete the value at the given key, if it exists.
@@ -463,6 +475,60 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+# Atomically store a result (hash field) and arm its ready-notification. The
+# notification list is armed only when absent, so repeated writes never queue
+# duplicate tokens, and the outbox set records notifications that still need
+# to converge (e.g. the writer was interrupted before a blocked waiter could
+# be serviced). KEYS: result-hash, notify-list, outbox-set.
+# ARGV: result-key(field), value, notify-ttl.
+RESULT_STORE_LUA = """\
+redis.call('hset', KEYS[1], ARGV[1], ARGV[2])
+if redis.call('exists', KEYS[2]) == 0 then
+  redis.call('lpush', KEYS[2], '1')
+  redis.call('expire', KEYS[2], tonumber(ARGV[3]))
+  redis.call('sadd', KEYS[3], ARGV[1])
+end
+return 1"""
+
+# Recovery counterpart to RESULT_STORE_LUA. The result is never rewritten: if
+# it still exists, the ready-token is (re-)armed exactly once; if it is gone,
+# no notification is manufactured. The outbox entry is removed either way, so
+# running this repeatedly is idempotent.
+# KEYS: result-hash, notify-list, outbox-set. ARGV: result-key(field), ttl.
+RESULT_RESTORE_LUA = """\
+if redis.call('hexists', KEYS[1], ARGV[1]) == 1 then
+  if redis.call('exists', KEYS[2]) == 0 then
+    redis.call('lpush', KEYS[2], '1')
+    redis.call('expire', KEYS[2], tonumber(ARGV[2]))
+  end
+end
+redis.call('srem', KEYS[3], ARGV[1])
+return 1"""
+
+# Same as RESULT_STORE_LUA, but for storages that keep each result in its own
+# key with an expiration. KEYS: result-key, notify-list, outbox-set.
+# ARGV: value, result-ttl, result-key(outbox member), notify-ttl.
+RESULT_EXPIRE_STORE_LUA = """\
+redis.call('set', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+if redis.call('exists', KEYS[2]) == 0 then
+  redis.call('lpush', KEYS[2], '1')
+  redis.call('expire', KEYS[2], tonumber(ARGV[4]))
+  redis.call('sadd', KEYS[3], ARGV[3])
+end
+return 1"""
+
+# Recovery counterpart to RESULT_EXPIRE_STORE_LUA.
+# KEYS: result-key, notify-list, outbox-set. ARGV: result-key, notify-ttl.
+RESULT_EXPIRE_RESTORE_LUA = """\
+if redis.call('exists', KEYS[1]) == 1 then
+  if redis.call('exists', KEYS[2]) == 0 then
+    redis.call('lpush', KEYS[2], '1')
+    redis.call('expire', KEYS[2], tonumber(ARGV[2]))
+  end
+end
+redis.call('srem', KEYS[3], ARGV[1])
+return 1"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
@@ -498,12 +564,19 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._result_store = self.conn.register_script(RESULT_STORE_LUA)
+        self._result_restore = self.conn.register_script(RESULT_RESTORE_LUA)
 
         self.name = self.clean_name(name) if clean_name else name
         self.queue_key = 'huey.redis.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.counter_key = 'huey.counters.%s' % self.name
+        # Set of result keys whose ready-notification has not yet converged.
+        # It is populated atomically with the result write and drained when
+        # the notification settles (a waiter confirms, the result is
+        # consumed, or a recovery sweep completes it).
+        self.outbox_key = 'huey.outbox.%s' % self.name
         self.notify_prefix = 'huey.notify.%s.' % self.name
         self.notify_result = notify_result  # Use result notification.
         self.notify_result_ttl = notify_result_ttl
@@ -601,19 +674,23 @@ class RedisStorage(BaseStorage):
     def flush_schedule(self):
         self.conn.delete(self.schedule_key)
 
-    def _notify(self, key):
+    def _notify_key(self, key):
         if isinstance(key, bytes):
             key = key.decode('utf8')
-        nkey = self.notify_prefix + key
-        pipe = self.conn.pipeline()
-        pipe.lpush(nkey, b'1')
-        pipe.expire(nkey, self.notify_result_ttl)
-        pipe.execute()
+        return self.notify_prefix + key
 
     def put_data(self, key, value, is_result=False):
-        self.conn.hset(self.result_key, key, value)
         if is_result and self.notify_result:
-            self._notify(key)
+            # The result write and the ready-notification are applied in a
+            # single atomic script, so a writer interrupted between the two
+            # can never leave a result that no waiter is ever woken for.
+            self._result_store(
+                keys=[self.result_key, self._notify_key(key),
+                      self.outbox_key],
+                args=[key, value, self.notify_result_ttl])
+        else:
+            # Metadata (revocation keys, locks, ...) must never notify.
+            self.conn.hset(self.result_key, key, value)
 
     def peek_data(self, key):
         val = self.conn.hget(self.result_key, key)
@@ -627,33 +704,93 @@ class RedisStorage(BaseStorage):
         pipe = self.conn.pipeline()
         pipe.hget(self.result_key, key)
         pipe.hdel(self.result_key, key)
-        val, _ = pipe.execute()
-        return EmptyData if val is None else val
+        if self.notify_result:
+            # The result is gone: settle its outbox entry and retire the
+            # ready-token so it cannot spuriously wake a later waiter.
+            pipe.srem(self.outbox_key, key)
+            pipe.delete(self._notify_key(key))
+        results = pipe.execute()
+        return EmptyData if results[0] is None else results[0]
 
     def delete_data(self, key):
-        return self.conn.hdel(self.result_key, key) != 0
+        if not self.notify_result:
+            return self.conn.hdel(self.result_key, key) != 0
+        pipe = self.conn.pipeline()
+        pipe.hdel(self.result_key, key)
+        pipe.srem(self.outbox_key, key)
+        pipe.delete(self._notify_key(key))
+        return pipe.execute()[0] != 0
 
     def wait_result(self, key, timeout=None, backoff=1.15, max_delay=1.0):
         if not self.notify_result:
             return super(RedisStorage, self).wait_result(key, timeout,
                                                          backoff, max_delay)
 
-        if self.has_data_for_key(key):
-            return True
-        nkey = self.notify_prefix + key
-        timeout = timeout or 0
-        if timeout > 0 and self.redis_version[0] < 6:
-            timeout = max(1, int(timeout))  # Timeout must be int for R < 6.
-        try:
-            result = self.conn.blpop(nkey, timeout=timeout)
-        except (ConnectionError, TimeoutError):
-            return False
+        nkey = self._notify_key(key)
+        # A non-positive timeout (or none) blocks indefinitely.
+        deadline = (None if not timeout or timeout <= 0 else
+                    time.monotonic() + timeout)
+        first = True
+        while True:
+            # Fast path: a result stored before we began waiting (including a
+            # notification orphaned by an interrupted writer) is visible
+            # immediately.
+            if self.has_data_for_key(key):
+                return True
 
-        if result is not None:
-            self.conn.delete(nkey)
+            if first:
+                # Honor the requested timeout verbatim on the first BLPOP.
+                wait = 0.0 if deadline is None else float(timeout)
+                first = False
+            elif deadline is None:
+                wait = 0.0
+            else:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    return False
+            if wait and self.redis_version[0] < 6:
+                # Timeout must be int for R < 6.
+                wait = max(1, int(wait))
+            try:
+                result = self.conn.blpop(nkey, timeout=wait or 0)
+            except (ConnectionError, TimeoutError):
+                return False
+
+            if result is None:
+                # BLPOP timed out -- make one final check, as a token may have
+                # been armed in the meantime.
+                return self.has_data_for_key(key)
+
+            # A ready-token woke us, but a token alone is not proof: it may be
+            # a duplicate or a stale token left after the result was consumed.
+            # Re-validate against the result store before returning.
+            if not self.has_data_for_key(key):
+                continue  # Stale token consumed by BLPOP; keep waiting.
+
+            # Settle the outbox entry and relay one token: a single LPUSH only
+            # wakes one BLPOP client, so each confirmed waiter arms the next
+            # token until all peers waiting on this key have been woken.
+            pipe = self.conn.pipeline()
+            pipe.srem(self.outbox_key, key)
+            pipe.lpush(nkey, b'1')
+            pipe.expire(nkey, self.notify_result_ttl)
+            pipe.execute()
             return True
 
-        return self.has_data_for_key(key)
+    def restore_result_notifications(self):
+        if not self.notify_result:
+            return 0
+        # Re-arm (exactly once) the ready-token for every result whose
+        # notification never converged because its writer was interrupted.
+        # Each entry is settled by an idempotent script -- a crash mid-sweep
+        # simply leaves the remainder for a subsequent run.
+        members = self.conn.smembers(self.outbox_key)
+        for key in members:
+            self._result_restore(
+                keys=[self.result_key, self._notify_key(key),
+                      self.outbox_key],
+                args=[key, self.notify_result_ttl])
+        return len(members)
 
     def has_data_for_key(self, key):
         return self.conn.hexists(self.result_key, key)
@@ -682,7 +819,10 @@ class RedisStorage(BaseStorage):
                 in self.conn.hgetall(self.result_key).items()}
 
     def flush_results(self):
-        self.conn.delete(self.result_key)
+        if self.notify_result:
+            self.conn.delete(self.result_key, self.outbox_key)
+        else:
+            self.conn.delete(self.result_key)
 
     def flush_counters(self):
         self.conn.delete(self.counter_key)
@@ -704,14 +844,29 @@ class RedisExpireStorage(RedisStorage):
         self.result_key = lambda k: rp + encode(k)
         self.counter_key = lambda k: cp + encode(k)
 
+        if self.notify_result:
+            # Override the hash-based scripts with versions that store each
+            # result in its own expiring key.
+            self._result_store = self.conn.register_script(
+                RESULT_EXPIRE_STORE_LUA)
+            self._result_restore = self.conn.register_script(
+                RESULT_EXPIRE_RESTORE_LUA)
+
     def put_data(self, key, value, is_result=False):
         if is_result:
             # We only want to expire task result data. If we are storing an
             # important metadata like a revocation key, we need to preserve it.
-            self.conn.set(self.result_key(key), value, ex=self._expire_time)
             if self.notify_result:
-                self._notify(key)
+                self._result_store(
+                    keys=[self.result_key(key), self._notify_key(key),
+                          self.outbox_key],
+                    args=[value, self._expire_time, key,
+                          self.notify_result_ttl])
+            else:
+                self.conn.set(self.result_key(key), value,
+                              ex=self._expire_time)
         else:
+            # Metadata never expires and never notifies.
             self.conn.set(self.result_key(key), value)
 
     def peek_data(self, key):
@@ -728,7 +883,24 @@ class RedisExpireStorage(RedisStorage):
     pop_data = peek_data
 
     def delete_data(self, key):
-        return self.conn.delete(self.result_key(key))
+        if not self.notify_result:
+            return self.conn.delete(self.result_key(key))
+        pipe = self.conn.pipeline()
+        pipe.delete(self.result_key(key))
+        pipe.srem(self.outbox_key, key)
+        pipe.delete(self._notify_key(key))
+        return pipe.execute()[0] != 0
+
+    def restore_result_notifications(self):
+        if not self.notify_result:
+            return 0
+        members = self.conn.smembers(self.outbox_key)
+        for key in members:
+            self._result_restore(
+                keys=[self.result_key(key), self._notify_key(key),
+                      self.outbox_key],
+                args=[key, self.notify_result_ttl])
+        return len(members)
 
     def has_data_for_key(self, key):
         return self.conn.exists(self.result_key(key)) != 0
@@ -768,6 +940,8 @@ class RedisExpireStorage(RedisStorage):
         keys = list(self._result_keys())
         if keys:
             self.conn.delete(*keys)
+        if self.notify_result:
+            self.conn.delete(self.outbox_key)
 
     def flush_counters(self):
         keys = list(self._counter_keys())

@@ -63,6 +63,13 @@ Huey types
     but this can be controlled with the ``notify_result_ttl`` parameter.
     **All RedisHuey** implementations support these options.
 
+    The result write and its readiness notification are applied atomically and
+    tracked in an outbox, so a writer interrupted between the two cannot leave
+    a finished result whose callers block until their timeout. When a consumer
+    starts it reconciles any pending notifications: results that still exist
+    re-arm their readiness list, repeatedly and without duplicate
+    notifications or rewriting the result.
+
     .. seealso:: :py:class:`RedisStorage`
 
 .. py:class:: PriorityRedisHuey
