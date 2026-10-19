@@ -2526,6 +2526,16 @@ Huey comes with several built-in storage implementations:
     operations. This is done to prevent race-conditions when reading from the
     file-system.
 
+    Result writes are committed with a checksummed staging file, an atomic
+    rename and fsync. When a storage instance starts it replays any result
+    commits interrupted by a crash: staging files whose contents are still
+    intact are renamed into place and become readable through the regular
+    result APIs, while torn or otherwise unconfirmable staging files are
+    moved (never deleted) into the ``corrupt/`` sub-directory. Files that
+    were already committed, as well as unrelated files placed in the storage
+    directory, are left untouched. Recovery is idempotent and can also be
+    invoked explicitly with :py:meth:`FileStorage.recover_results`.
+
 
 .. py:class:: MemoryStorage()
 

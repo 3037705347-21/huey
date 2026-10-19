@@ -13,6 +13,7 @@ except ImportError:
 import struct
 import threading
 import time
+import zlib
 
 try:
     import cysqlite
@@ -1448,6 +1449,14 @@ class FileStorage(BaseStorage):
     """
     MAX_PRIORITY = 0xffff
 
+    # Committed result files may be stored in either the legacy format
+    # (``[key_len:4][key][value]``) or the self-validating commit envelope
+    # (``MAGIC + payload + crc32:4``). The envelope's first byte can never
+    # appear in a legacy file, whose first four bytes are a small key length.
+    RESULT_MAGIC = b'HUEC'
+    STAGING_SUFFIX = '.tmp'
+    _STAGING_RE = re.compile(r'[0-9a-f]{32}\.tmp$')
+
     def __init__(self, name, path, levels=2, use_thread_lock=False,
                  **storage_kwargs):
         super(FileStorage, self).__init__(name, **storage_kwargs)
@@ -1462,6 +1471,8 @@ class FileStorage(BaseStorage):
         self.schedule_path = os.path.join(self.path, 'schedule')
         self.result_path = os.path.join(self.path, 'results')
         self.counter_path = os.path.join(self.path, 'counters')
+        # Files quarantined by crash-recovery are moved here, never deleted.
+        self.corrupt_path = os.path.join(self.path, 'corrupt')
         self.levels = levels
 
         if use_thread_lock:
@@ -1469,6 +1480,9 @@ class FileStorage(BaseStorage):
         else:
             self.lock_file = os.path.join(self.path, '.lock')
             self.lock = FileLock(self.lock_file)
+
+        # Replay any result commits interrupted by a crash before serving.
+        self.recover_results()
 
     def _flush_dir(self, path):
         if os.path.exists(path):
@@ -1599,6 +1613,52 @@ class FileStorage(BaseStorage):
         with self.lock:
             self._put_data(key, value)
 
+    def _fsync_file(self, fh):
+        # Flush file data to disk. Failures are tolerated for filesystems
+        # that do not support fsync -- the atomic rename still applies.
+        try:
+            fh.flush()
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+
+    def _fsync_dir(self, path):
+        # Persist a rename/create that happened inside the given directory.
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _pack_envelope(self, key, value):
+        # Build a self-validating commit envelope. The payload uses the
+        # legacy layout so readers can extract the value after stripping the
+        # envelope wrapper, and the trailing checksum lets crash-recovery
+        # distinguish a complete staged write from a torn one.
+        payload = struct.pack('>I', len(key)) + key + value
+        crc = zlib.crc32(payload) & 0xffffffff
+        return self.RESULT_MAGIC + payload + struct.pack('>I', crc)
+
+    def _load_envelope(self, data):
+        # Return the legacy-layout payload from a commit envelope, or None
+        # if the envelope is truncated/corrupted.
+        if len(data) < 8 or data[:4] != self.RESULT_MAGIC:
+            return
+        payload, (crc,) = data[4:-4], struct.unpack('>I', data[-4:])
+        if (zlib.crc32(payload) & 0xffffffff) != crc:
+            return
+        if len(payload) < 4:
+            return
+        key_len, = struct.unpack('>I', payload[:4])
+        if len(payload) < 4 + key_len:
+            return
+        return payload
+
     def _put_data(self, key, value):
         # Write a key/value pair. The lock must already be held.
         if isinstance(key, str):
@@ -1610,13 +1670,12 @@ class FileStorage(BaseStorage):
         if not os.path.exists(dirname):
             os.makedirs(dirname)
 
-        tmp = filename + '.tmp'
+        tmp = filename + self.STAGING_SUFFIX
         with open(tmp, 'wb') as fh:
-            key_len = len(key)
-            fh.write(struct.pack('>I', key_len))
-            fh.write(key)
-            fh.write(value)
+            fh.write(self._pack_envelope(key, value))
+            self._fsync_file(fh)
         os.replace(tmp, filename)
+        self._fsync_dir(dirname)
 
     def put_if_empty(self, key, value, ttl=None):
         if ttl is not None:
@@ -1628,11 +1687,105 @@ class FileStorage(BaseStorage):
             return True
 
     def _unpack_result(self, data):
+        if data[:4] == self.RESULT_MAGIC:
+            data = self._load_envelope(data)
+            if data is None:
+                # Envelope present but its checksum does not match.
+                return None, None
         key_len, = struct.unpack('>I', data[:4])
         key = data[4:4 + key_len]
         if len(key) != key_len:
             return None, None
         return key, data[4 + key_len:]
+
+    def _pending_commit_files(self):
+        # Yield staging files left behind by an interrupted result commit.
+        # Only files matching the sharded layout (``<md5>.tmp`` at the
+        # expected shard depth) are considered ours; any other files --
+        # including foreign ".tmp" files placed in the directory -- are left
+        # exactly where they are.
+        for root, _, filenames in os.walk(self.result_path):
+            rel_dir = os.path.relpath(root, self.result_path)
+            depth = 0 if rel_dir == '.' else rel_dir.count(os.sep) + 1
+            if depth != self.levels:
+                continue
+            for filename in filenames:
+                if self._STAGING_RE.match(filename):
+                    yield os.path.join(root, filename)
+
+    def _quarantine_file(self, path):
+        # Move an unconfirmable staging file out of the result tree without
+        # deleting it, preserving its relative location. Conflicting names
+        # get a numeric suffix so repeated recoveries never overwrite
+        # quarantined evidence.
+        rel_path = os.path.relpath(path, self.result_path)
+        dest_dir = os.path.join(self.corrupt_path, os.path.dirname(rel_path))
+        if not os.path.exists(dest_dir):
+            os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, os.path.basename(rel_path))
+        conflict = 0
+        while os.path.exists(dest):
+            conflict += 1
+            dest = os.path.join(dest_dir,
+                                '%s.%03d' % (os.path.basename(rel_path),
+                                             conflict))
+        os.replace(path, dest)
+        return dest
+
+    def recover_results(self):
+        """
+        Replay result commits interrupted by a crash or power loss.
+
+        Staging files (``<key>.tmp``) left in the result tree are inspected:
+        files with an intact commit envelope are completed via the same
+        atomic rename used by a normal write, so their values become visible
+        through the regular read APIs; torn or otherwise unconfirmable
+        files are moved, intact, to the ``corrupt/`` quarantine directory.
+
+        Already-committed result files and any foreign files in the tree
+        are never touched. The procedure is idempotent and safe to replay.
+
+        :return: Tuple of ``(replayed, quarantined)`` counts.
+        """
+        replayed = quarantined = 0
+        with self.lock:
+            if not os.path.isdir(self.result_path):
+                return replayed, quarantined
+
+            for tmp_path in list(self._pending_commit_files()):
+                final_path = tmp_path[:-len(self.STAGING_SUFFIX)]
+                try:
+                    with open(tmp_path, 'rb') as fh:
+                        data = fh.read()
+                except OSError:
+                    # File vanished mid-scan -- skip it; a later replay
+                    # converges on the same state.
+                    continue
+
+                payload = self._load_envelope(data)
+                key = None
+                if payload is not None:
+                    key_len, = struct.unpack('>I', payload[:4])
+                    key = payload[4:4 + key_len]
+
+                if key is None or self.path_for_key(key) != final_path:
+                    # Unconfirmable content: quarantine rather than delete.
+                    if os.path.exists(tmp_path):
+                        self._quarantine_file(tmp_path)
+                        quarantined += 1
+                    continue
+
+                try:
+                    os.replace(tmp_path, final_path)
+                except OSError:
+                    if os.path.exists(tmp_path):
+                        self._quarantine_file(tmp_path)
+                        quarantined += 1
+                    continue
+                self._fsync_dir(os.path.dirname(final_path))
+                replayed += 1
+
+        return replayed, quarantined
 
     def peek_data(self, key):
         filename = self.path_for_key(key)

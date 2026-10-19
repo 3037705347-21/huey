@@ -738,6 +738,106 @@ class TestFileStorageMethods(StorageTests, BaseTestCase):
         self.assertEqual(s.result_items(), {'k1': b'v1'})
         self.assertEqual(s.result_store_size(), 1)
 
+    def _stage_result(self, storage, key, value):
+        # Simulate a crash between the staged write and the atomic rename.
+        tmp_path = storage.path_for_key(key) + storage.STAGING_SUFFIX
+        os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+        with open(tmp_path, 'wb') as fh:
+            fh.write(storage._pack_envelope(key, value))
+        return tmp_path
+
+    def _restart_storage(self):
+        # A fresh storage instance emulates a process restart: recovery runs
+        # automatically during initialization.
+        return FileStorage('test-file-storage', path=self.path, levels=2,
+                           use_thread_lock=True)
+
+    def test_fs_result_recovery_replays_intact_commit(self):
+        s = self.huey.storage
+        # An already-committed result must survive recovery untouched.
+        s.put_data(b'committed', b'kept')
+        # A file placed manually at the results root is not ours to manage.
+        foreign_path = os.path.join(self.result_path, 'my-own-file.txt')
+        with open(foreign_path, 'wb') as fh:
+            fh.write(b'foreign-bytes')
+
+        # First commit for the key completed; a second commit was interrupted
+        # after the staged write but before the rename. Readers still see the
+        # previously committed value.
+        s.put_data(b'pending', b'old-value')
+        tmp_path = self._stage_result(s, b'pending', b'recovered-value')
+        self.assertEqual(s.peek_data(b'pending'), b'old-value')
+
+        # Restart: the confirmable write is replayed and the value becomes
+        # readable through the normal result-reading interface.
+        s2 = self._restart_storage()
+        self.assertFalse(os.path.exists(tmp_path))
+        self.assertEqual(s2.peek_data(b'pending'), b'recovered-value')
+        self.assertEqual(s2.peek_data(b'committed'), b'kept')
+        self.assertEqual(s2.result_items(),
+                         {'committed': b'kept',
+                          'pending': b'recovered-value'})
+        with open(foreign_path, 'rb') as fh:
+            self.assertEqual(fh.read(), b'foreign-bytes')
+
+        # Recovery is replayable/idempotent, then pop_data works as usual.
+        self.assertEqual(s2.recover_results(), (0, 0))
+        self.assertEqual(s2.peek_data(b'pending'), b'recovered-value')
+        self.assertEqual(s2.pop_data(b'pending'), b'recovered-value')
+        self.assertIs(s2.peek_data(b'pending'), EmptyData)
+
+    def test_fs_result_recovery_quarantines_corrupt_commit(self):
+        s = self.huey.storage
+        s.put_data(b'committed', b'kept')
+
+        # Torn write: envelope magic present but checksum/length invalid.
+        bad_crc_path = s.path_for_key(b'bad-crc') + s.STAGING_SUFFIX
+        os.makedirs(os.path.dirname(bad_crc_path), exist_ok=True)
+        with open(bad_crc_path, 'wb') as fh:
+            fh.write(s.RESULT_MAGIC + struct.pack('>I', 7) + b'bad-crc'
+                     + b'\x00\x00\x00\x00')
+        # Partial write with no recognizable envelope at all.
+        partial_path = self._stage_result(s, b'partial', b'x')
+        with open(partial_path, 'wb') as fh:
+            fh.write(b'partial-write')
+
+        # Foreign ".tmp" files (wrong location/name) must be left in place.
+        foreign_tmp = os.path.join(self.result_path, 'notes.tmp')
+        with open(foreign_tmp, 'wb') as fh:
+            fh.write(b'not-a-huey-staging-file')
+
+        s2 = self._restart_storage()
+
+        # Corrupt commits are invisible and their bytes are quarantined.
+        self.assertIs(s2.peek_data(b'bad-crc'), EmptyData)
+        self.assertIs(s2.peek_data(b'partial'), EmptyData)
+        self.assertFalse(os.path.exists(bad_crc_path))
+        self.assertFalse(os.path.exists(partial_path))
+
+        quarantined = os.path.join(
+            self.path, 'corrupt',
+            os.path.relpath(bad_crc_path, self.result_path))
+        with open(quarantined, 'rb') as fh:
+            self.assertTrue(fh.read().startswith(s.RESULT_MAGIC))
+        quarantined_partial = os.path.join(
+            self.path, 'corrupt',
+            os.path.relpath(partial_path, self.result_path))
+        with open(quarantined_partial, 'rb') as fh:
+            self.assertEqual(fh.read(), b'partial-write')
+
+        # Committed results and foreign files are preserved.
+        self.assertEqual(s2.peek_data(b'committed'), b'kept')
+        self.assertTrue(os.path.exists(foreign_tmp))
+        self.assertEqual(s2.result_items(), {'committed': b'kept'})
+
+        # Replay is a no-op once the directory is consistent; a second
+        # quarantined clash gets a unique suffix instead of overwriting.
+        self.assertEqual(s2.recover_results(), (0, 0))
+        with open(bad_crc_path, 'wb') as fh:
+            fh.write(b'torn-again')
+        self.assertEqual(s2.recover_results(), (0, 1))
+        self.assertTrue(os.path.exists(quarantined + '.001'))
+
     def test_fs_multithreaded(self):
         l = threading.Lock()
 
