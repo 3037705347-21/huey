@@ -11,6 +11,7 @@ from huey.api import RedisHuey
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.storage import RedisStorage
+from huey.storage import ENQUEUE_ONCE_HASH_LIST_LUA
 from huey.storage import SCHEDULE_POP_LUA
 
 
@@ -35,6 +36,7 @@ class ValkeyGlideStorage(RedisStorage):
             self.conn = GlideClient.create(config)
 
         self._pop = Script(SCHEDULE_POP_LUA)
+        self._enqueue_once = Script(ENQUEUE_ONCE_HASH_LIST_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
@@ -60,6 +62,16 @@ class ValkeyGlideStorage(RedisStorage):
             raise NotImplementedError('Task priorities are not supported by '
                                       'this storage.')
         self.conn.lpush(self.queue_key, [data])
+
+    def enqueue_once(self, key, data, priority=None):
+        if priority:
+            raise NotImplementedError('Task priorities are not supported by '
+                                      'this storage.')
+        result = self.conn.invoke_script(
+            self._enqueue_once,
+            keys=[self.result_key, self.queue_key],
+            args=[key, data, b'1'])
+        return bool(result)
 
     def dequeue(self):
         return self.conn.rpop(self.queue_key)

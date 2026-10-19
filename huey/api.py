@@ -338,6 +338,12 @@ class Huey(object):
     def _enqueue_chord(self, chord_obj):
         cid = str(uuid.uuid4())
         size = len(chord_obj.tasks)
+
+        # Persist the chord record before any member can finish. It carries
+        # everything a restart needs to finish the aggregation, and startup
+        # recovery uses it to discover interrupted chords.
+        self._chord_register(cid, size, chord_obj.callback)
+
         results = []
         for i, task in enumerate(chord_obj.tasks):
             if isinstance(task, group):
@@ -586,24 +592,143 @@ class Huey(object):
             task = task.on_complete
 
     def _check_chord(self, cc, value):
-        chord_key = 'chord:%s' % cc.cid
-        result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
-        self.put_result(result_key, value)
+        # Store the member placeholder (success value, Error or SKIPPED),
+        # then count the report. Both survive a restart, so the finalization
+        # below can be re-driven by startup recovery if it is interrupted.
+        self.put_result('chord:%s:%s' % (cc.cid, cc.idx), value)
+        if self.storage.incr('chord:%s' % cc.cid) == cc.size:
+            self._finalize_chord(cc.cid, cc.size, cc.callback)
 
-        if self.storage.incr(chord_key) == cc.size:
-            self.storage.delete_counter(chord_key)
+    def _finalize_chord(self, cid, size, callback):
+        # Build the unique aggregation commit, then deliver the callback from
+        # it. Either step is idempotent and restart-safe on its own.
+        self._chord_claim(cid, size, callback)
+        self._chord_deliver(cid, size)
 
-            # Read raw results w/o raising for errors, then delete explicitly
-            # as expiring storages implement pop_data as a peek.
-            results = []
-            for idx in range(cc.size):
-                key = 'chord:%s:%s' % (cc.cid, idx)
-                results.append(self.get(key, peek=True))
-                self.delete(key)
+    def _chord_register(self, cid, size, callback):
+        # The record recovery scans for: member count plus the serialized
+        # callback template, which no longer exists anywhere in the queue once
+        # every member has finished.
+        message = self.serialize_task(callback)
+        self.put_if_empty('chord:meta:%s' % cid, (size, message))
 
-            callback = cc.callback
-            callback.extend_data((results,))
-            self.enqueue(callback)
+    def _chord_claim(self, cid, size, callback):
+        # Aggregate the member placeholders in declaration order into a single
+        # outbox message. The commit key is written with put_if_empty, so the
+        # aggregation is committed exactly once no matter how many times the
+        # last member reports or recovery runs.
+        commit_key = 'chord:commit:%s' % cid
+        keys = ['chord:%s:%s' % (cid, idx) for idx in range(size)]
+        placeholders = self.storage.peek_many(keys)
+        if len(placeholders) < size:
+            logger.warning('Chord %s is missing member results, cannot '
+                           'finalize (%s/%s present).', cid,
+                           len(placeholders), size)
+            return False
+        results = [self.serializer.deserialize(placeholders[key])
+                   for key in keys]
+        callback.extend_data((results,))
+        message = self.serialize_task(callback)
+        return self.storage.put_if_empty(commit_key, message)
+
+    def _chord_deliver(self, cid, size=None):
+        # Deliver the committed callback exactly once. The queue insert and
+        # the delivery marker commit atomically (enqueue_once), so an
+        # interrupted delivery is retried without ever duplicating the callback.
+        commit_key = 'chord:commit:%s' % cid
+        done_key = 'chord:done:%s' % cid
+        message = self.storage.peek_data(commit_key)
+        if message is EmptyData:
+            return False
+
+        task = self.deserialize_task(message)
+        if self._immediate:
+            self._emit(S.SIGNAL_ENQUEUED, task)
+            self.execute(task)
+            delivered = True
+        else:
+            already_delivered = self.storage.has_data_for_key(done_key)
+            if not already_delivered:
+                self._emit(S.SIGNAL_ENQUEUED, task)
+            delivered = already_delivered or self.storage.enqueue_once(
+                done_key, message, task.priority)
+
+        if delivered:
+            # The callback is safely in the queue; all coordination state can
+            # go. A crash midway is resumed by a later recovery pass.
+            self._chord_cleanup(cid, size)
+        return delivered
+
+    def _chord_cleanup(self, cid, size=None):
+        if size is None:
+            # Recovery may resume here after the meta record (and thus the
+            # member count) has already been removed.
+            prefix = 'chord:%s:' % cid
+            member_keys = [key for key in self.storage.result_items()
+                           if key.startswith(prefix)]
+        else:
+            member_keys = ['chord:%s:%s' % (cid, idx)
+                           for idx in range(size)]
+        for key in member_keys:
+            self.delete(key)
+        self.storage.delete_counter('chord:%s' % cid)
+        self.delete('chord:meta:%s' % cid)
+        # Remove the commit before its delivery marker: as long as the commit
+        # exists the marker must remain, otherwise a crash here could cause the
+        # callback to be enqueued twice.
+        self.delete('chord:commit:%s' % cid)
+        self.delete('chord:done:%s' % cid)
+
+    def recover_chords(self):
+        """
+        Complete any chord finalizations interrupted by a process restart.
+
+        Committed aggregations are delivered once, partial aggregations are
+        finished when all member placeholders are present, and chords still
+        waiting on members are left untouched. Returns the number of chords
+        finalized or delivered. Safe to run concurrently from more than one
+        consumer process.
+        """
+        metas, commits, dones = set(), set(), set()
+        for key in self.storage.result_items():
+            if key.startswith('chord:meta:'):
+                metas.add(key[11:])
+            elif key.startswith('chord:commit:'):
+                commits.add(key[13:])
+            elif key.startswith('chord:done:'):
+                dones.add(key[11:])
+
+        finalized = 0
+        for cid in sorted(metas | commits | dones):
+            if self._recover_chord(cid):
+                finalized += 1
+        return finalized
+
+    def _recover_chord(self, cid):
+        meta_key = 'chord:meta:%s' % cid
+        commit_key = 'chord:commit:%s' % cid
+        done_key = 'chord:done:%s' % cid
+
+        size = None
+        meta = self.get(meta_key, peek=True)
+        if meta is not EmptyData:
+            size, cb_message = meta
+
+        if self.storage.peek_data(commit_key) is EmptyData:
+            if size is not None:
+                # Re-aggregate when every member placeholder is present. A
+                # chord still waiting on members is left exactly as-is.
+                callback = self.deserialize_task(cb_message)
+                self._chord_claim(cid, size, callback)
+
+            if self.storage.peek_data(commit_key) is EmptyData:
+                # Nothing committable. The only recoverable residue is an
+                # interrupted cleanup that left the delivery marker behind.
+                if size is None and self.storage.has_data_for_key(done_key):
+                    self._chord_cleanup(cid, None)
+                return False
+
+        return self._chord_deliver(cid, size)
 
     def _requeue_task(self, task, timestamp, retry_eta=None):
         task.retries -= 1

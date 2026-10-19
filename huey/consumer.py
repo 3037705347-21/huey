@@ -465,6 +465,19 @@ class Consumer(object):
 
         self._logger.info('\n'.join(msg))
 
+        # Finish any chord finalizations interrupted by an earlier shutdown
+        # before workers are started, so recovered callbacks join the queue
+        # ahead of new work. Claims in the storage layer make this safe to run
+        # from more than one consumer process.
+        try:
+            recovered = self.huey.recover_chords()
+        except Exception:
+            self._logger.exception('Chord recovery failed during startup.')
+        else:
+            if recovered:
+                self._logger.info('Recovered %s interrupted chord(s).',
+                                  recovered)
+
         # Start the scheduler and workers.
         self.scheduler.start()
         for _, worker_process in self.worker_threads:

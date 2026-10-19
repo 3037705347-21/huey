@@ -2021,6 +2021,230 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(self.huey.storage._counters, {})
         self.assertEqual(self.huey.result_count(), 0)
 
+    def _crash_chord_delivery(self):
+        # Simulate the process dying after the aggregation was committed but
+        # before the callback was delivered. Returns (cid, size).
+        pending = []
+        self.huey._chord_deliver = lambda *args: pending.append(args)
+        return pending
+
+    def test_chord_recovery_after_crash(self):
+        @self.huey.task()
+        def prod(n):
+            if n is None:
+                raise TestError('bad')
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        pending = self._crash_chord_delivery()
+        c = chord([prod.s(1), prod.s(None), prod.s(3)], agg.s())
+        r = self.huey.enqueue(c)
+        members = list(r.results)
+        members[2].revoke()
+
+        # Execute the members out of order -- aggregation must still follow
+        # the declaration order.
+        tasks = [self.huey.dequeue() for _ in range(3)]
+        by_idx = {t.chord_config.idx: t for t in tasks}
+        self.huey.execute(by_idx[2])
+        self.huey.execute(by_idx[0])
+        self.huey.execute(by_idx[1])
+
+        cid, size = pending[0][0], pending[0][1]
+        self.assertEqual(size, 3)
+        self.assertEqual(len(self.huey), 0)  # Callback never delivered.
+
+        storage = self.huey.storage
+        self.assertEqual(storage._counters['chord:%s' % cid], 3)
+        keys = storage.result_items()
+        self.assertIn('chord:meta:%s' % cid, keys)
+        self.assertIn('chord:commit:%s' % cid, keys)
+        self.assertNotIn('chord:done:%s' % cid, keys)
+        for idx in range(3):
+            self.assertIn('chord:%s:%s' % (cid, idx), keys)
+
+        # Restart: recovery aggregates once and delivers the single callback.
+        del self.huey._chord_deliver
+        self.assertEqual(self.huey.recover_chords(), 1)
+        self.assertEqual(len(self.huey), 1)
+
+        v0, err, skipped = self.execute_next()
+        self.assertEqual(v0, 2)
+        self.assertTrue(isinstance(err, Error))
+        self.assertEqual(err.metadata['error'], 'TestError(bad)')
+        self.assertTrue(skipped is SKIPPED)
+        self.assertEqual(r(), [2, err, SKIPPED])
+
+        # A second recovery is a no-op and all coordination state is gone.
+        self.assertEqual(self.huey.recover_chords(), 0)
+        self.assertEqual(storage._counters, {})
+        self.assertFalse(any(k.startswith('chord:')
+                             for k in storage.result_items()))
+
+    def test_chord_recovery_delivery_is_unique(self):
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        pending = self._crash_chord_delivery()
+        r = self.huey.enqueue(chord([prod.s(1), prod.s(2)], agg.s()))
+        self.execute_next()
+        self.execute_next()
+        cid, size = pending[0][0], pending[0][1]
+
+        storage = self.huey.storage
+        commit_key = 'chord:commit:%s' % cid
+        done_key = 'chord:done:%s' % cid
+        message = storage.peek_data(commit_key)
+
+        # Simulate an interrupted delivery: message and marker committed
+        # atomically, but cleanup never ran.
+        self.assertTrue(storage.enqueue_once(done_key, message))
+        self.assertEqual(len(self.huey), 1)
+        # The marker makes any duplicate delivery a no-op.
+        self.assertFalse(storage.enqueue_once(done_key, b'garbage'))
+        self.assertEqual(len(self.huey), 1)
+
+        # Recovery only finishes cleanup; no second message is enqueued.
+        del self.huey._chord_deliver
+        self.assertEqual(self.huey.recover_chords(), 1)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.huey.recover_chords(), 0)
+        self.assertEqual(self.execute_next(), [2, 3])
+        self.assertEqual(r(), [2, 3])
+        self.assertEqual(storage._counters, {})
+
+    def test_chord_duplicate_completion_is_unique(self):
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        pending = self._crash_chord_delivery()
+        r = self.huey.enqueue(chord([prod.s(1), prod.s(2)], agg.s()))
+        self.execute_next()
+        self.execute_next()
+        cid, size = pending[0][0], pending[0][1]
+
+        # The callback template survives in the meta record.
+        size_meta, cb_message = self.huey.get('chord:meta:%s' % cid,
+                                              peek=True)
+        self.assertEqual(size_meta, size)
+        callback = self.huey.deserialize_task(cb_message)
+
+        # Complete the interrupted finalization, then complete it again:
+        # the duplicate commit/delivery must be a no-op.
+        del self.huey._chord_deliver
+        self.huey._finalize_chord(cid, size, callback)
+        self.huey._finalize_chord(cid, size, callback)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), [2, 3])
+        self.assertEqual(r(), [2, 3])
+
+    def test_chord_recovery_concurrent(self):
+        import threading
+
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        pending = self._crash_chord_delivery()
+        r = self.huey.enqueue(chord([prod.s(1), prod.s(2)], agg.s()))
+        self.execute_next()
+        self.execute_next()
+        cid = pending[0][0]
+        del self.huey._chord_deliver
+
+        barrier = threading.Barrier(8)
+        threads = []
+        def recover():
+            barrier.wait()
+            self.huey.recover_chords()
+        for _ in range(8):
+            t = threading.Thread(target=recover)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+        # Exactly one callback message despite concurrent recovery.
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), [2, 3])
+        self.assertEqual(r(), [2, 3])
+        self.assertFalse(any(k.startswith('chord:')
+                             for k in self.huey.storage.result_items()))
+
+    def test_chord_recovery_preserves_pending_chord(self):
+        @self.huey.task()
+        def pa(n):
+            return n + 1
+
+        @self.huey.task()
+        def pb(n):
+            return n + 10
+
+        @self.huey.task()
+        def agg_a(ns):
+            return ns
+
+        @self.huey.task()
+        def agg_b(ns):
+            return ns
+
+        pending = self._crash_chord_delivery()
+        ra = self.huey.enqueue(chord([pa.s(1), pa.s(2)], agg_a.s()))
+        rb = self.huey.enqueue(chord([pb.s(1), pb.s(2)], agg_b.s()))
+
+        tasks = [self.huey.dequeue() for _ in range(4)]
+        cid_a = tasks[0].chord_config.cid
+        cid_b = None
+        for task in tasks:
+            cc = task.chord_config
+            if cc.cid == cid_a:
+                self.huey.execute(task)
+            elif cc.idx == 0:
+                cid_b = cc.cid
+                self.huey.execute(task)
+
+        self.assertEqual([p[0] for p in pending], [cid_a])
+        del self.huey._chord_deliver
+
+        # Only the finished chord is recovered; the other keeps its scene.
+        self.assertEqual(self.huey.recover_chords(), 1)
+        self.assertEqual(len(self.huey), 1)
+        storage = self.huey.storage
+        self.assertIn('chord:meta:%s' % cid_b, storage.result_items())
+        self.assertIn('chord:%s:0' % cid_b, storage.result_items())
+        self.assertNotIn('chord:commit:%s' % cid_b, storage.result_items())
+        self.assertEqual(storage._counters['chord:%s' % cid_b], 1)
+
+        # The pending chord completes normally once its last member reports.
+        for task in tasks:
+            if task.chord_config.cid == cid_b and task.chord_config.idx == 1:
+                self.huey.execute(task)
+        self.assertEqual(len(self.huey), 2)
+        self.assertEqual(self.execute_next(), [2, 3])
+        self.assertEqual(self.execute_next(), [11, 12])
+        self.assertEqual(ra(), [2, 3])
+        self.assertEqual(rb(), [11, 12])
+        self.assertEqual(storage._counters, {})
+        self.assertFalse(any(k.startswith('chord:')
+                             for k in storage.result_items()))
+
     def test_chord_member_retry_then_success(self):
         # A chord member that fails once, then succeeds on retry, should
         # notify the chord with the success value -- not the initial failure.

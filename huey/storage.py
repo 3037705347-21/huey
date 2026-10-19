@@ -264,6 +264,30 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def enqueue_once(self, key, data, priority=None):
+        """
+        Atomically enqueue the given data and set a durable marker. If the
+        marker key already exists, the data is not enqueued again.
+
+        This is used to deliver a chord's callback exactly once: the marker
+        and the queue insert must commit together, so a crash between them can
+        neither duplicate nor lose the message.
+
+        :param bytes key: marker key in the key/value store.
+        :param bytes data: task data to enqueue.
+        :param float priority: priority, same semantics as ``enqueue``.
+        :return: True if the data was enqueued, False if the marker existed
+                 (i.e. the data was already delivered).
+        """
+        # Portable fallback for third-party backends. The marker is claimed
+        # before the enqueue, so a crash can never produce a duplicate message
+        # (it may instead leave a claim with no message, from which only an
+        # atomic backend can recover).
+        if not self.put_if_empty(key, b'1'):
+            return False
+        self.enqueue(data, priority)
+        return True
+
     def result_store_size(self):
         """
         :return: Number of key/value pairs in the result store.
@@ -325,6 +349,7 @@ class BlackHoleStorage(BaseStorage):
     def put_if_empty(self, key, value, ttl=None): return True
     def incr(self, key, amount=1): return amount
     def delete_counter(self, key): pass
+    def enqueue_once(self, key, data, priority=None): return True
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
@@ -439,6 +464,17 @@ class MemoryStorage(BaseStorage):
         with self._lock:
             self._counters.pop(key, None)
 
+    def enqueue_once(self, key, data, priority=None):
+        with self._lock:
+            self._expire(key)
+            if key in self._results:
+                return False
+            self._c += 1
+            priority = 0 if priority is None else -priority
+            heapq.heappush(self._queue, (priority, self._c, data))
+            self._results[key] = b'1'
+            return True
+
     def result_store_size(self):
         return len(self._results)
 
@@ -462,6 +498,40 @@ local res = redis.call('zrangebyscore', KEYS[1], '-inf', unix_ts)
 if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res then
     return res
 end"""
+
+# Atomically enqueue a message and set a durable marker field. When the marker
+# already exists nothing is enqueued, providing exactly-once delivery. Used to
+# finalize chords. Keys: result hash, queue list. Args: marker field, message,
+# marker value.
+ENQUEUE_ONCE_HASH_LIST_LUA = """\
+if redis.call('hexists', KEYS[1], ARGV[1]) == 1 then return 0 end
+redis.call('lpush', KEYS[2], ARGV[2])
+redis.call('hset', KEYS[1], ARGV[1], ARGV[3])
+return 1"""
+
+# Same for priority queues (sorted sets). The member carries the same timestamp
+# prefix as RedisPriorityQueue.enqueue. Args: marker field, score, member,
+# marker value. Keys: result hash, queue zset.
+ENQUEUE_ONCE_HASH_ZSET_LUA = """\
+if redis.call('hexists', KEYS[1], ARGV[1]) == 1 then return 0 end
+redis.call('zadd', KEYS[2], ARGV[2], ARGV[3])
+redis.call('hset', KEYS[1], ARGV[1], ARGV[4])
+return 1"""
+
+# Variants for the expiring storage, where the marker is a standalone key
+# instead of a hash field. Keys: marker key, queue. Args: message, marker.
+ENQUEUE_ONCE_KEY_LIST_LUA = """\
+if redis.call('exists', KEYS[1]) == 1 then return 0 end
+redis.call('lpush', KEYS[2], ARGV[1])
+redis.call('set', KEYS[1], ARGV[2])
+return 1"""
+
+# Args: score, member, marker value. Keys: marker key, queue zset.
+ENQUEUE_ONCE_KEY_ZSET_LUA = """\
+if redis.call('exists', KEYS[1]) == 1 then return 0 end
+redis.call('zadd', KEYS[2], ARGV[1], ARGV[2])
+redis.call('set', KEYS[1], ARGV[3])
+return 1"""
 
 
 class RedisStorage(BaseStorage):
@@ -498,6 +568,8 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._enqueue_once = self.conn.register_script(
+            ENQUEUE_ONCE_HASH_LIST_LUA)
 
         self.name = self.clean_name(name) if clean_name else name
         self.queue_key = 'huey.redis.%s' % self.name
@@ -552,6 +624,14 @@ class RedisStorage(BaseStorage):
             raise NotImplementedError('Task priorities are not supported by '
                                       'this storage.')
         self.conn.lpush(self.queue_key, data)
+
+    def enqueue_once(self, key, data, priority=None):
+        if priority:
+            raise NotImplementedError('Task priorities are not supported by '
+                                      'this storage.')
+        return bool(self._enqueue_once(
+            keys=[self.result_key, self.queue_key],
+            args=[key, data, b'1']))
 
     def dequeue(self):
         if self.blocking:
@@ -697,6 +777,9 @@ class RedisExpireStorage(RedisStorage):
 
         self._expire_time = expire_time
 
+        self._enqueue_once = self.conn.register_script(
+            ENQUEUE_ONCE_KEY_LIST_LUA)
+
         self.result_prefix = rp = b'huey.r.%s.' % self.name.encode('utf8')
         self.counter_prefix = cp = b'huey.c.%s.' % self.name.encode('utf8')
 
@@ -736,6 +819,14 @@ class RedisExpireStorage(RedisStorage):
     def put_if_empty(self, key, value, ttl=None):
         return bool(self.conn.set(self.result_key(key), value, nx=True,
                                   ex=ttl))
+
+    def enqueue_once(self, key, data, priority=None):
+        if priority:
+            raise NotImplementedError('Task priorities are not supported by '
+                                      'this storage.')
+        return bool(self._enqueue_once(
+            keys=[self.result_key(key), self.queue_key],
+            args=[data, b'1']))
 
     def incr(self, key, amount=1):
         pipe = self.conn.pipeline()
@@ -788,6 +879,17 @@ class RedisPriorityQueue(object):
         prefix = struct.pack('>Q', int(time.time() * 1e6))
         self.conn.zadd(self.queue_key, {prefix + data: priority})
 
+    def enqueue_once(self, key, data, priority=None):
+        script = getattr(self, '_enqueue_once_zset', None)
+        if script is None:
+            script = self.conn.register_script(ENQUEUE_ONCE_HASH_ZSET_LUA)
+            self._enqueue_once_zset = script
+        priority = 0 if priority is None else -priority
+        prefix = struct.pack('>Q', int(time.time() * 1e6))
+        return bool(script(
+            keys=[self.result_key, self.queue_key],
+            args=[key, str(priority), prefix + data, b'1']))
+
     def dequeue(self):
         if self.blocking:
             try:
@@ -820,7 +922,17 @@ class RedisPriorityQueue(object):
 class PriorityRedisStorage(RedisPriorityQueue, RedisStorage): pass
 
 
-class PriorityRedisExpireStorage(RedisPriorityQueue, RedisExpireStorage): pass
+class PriorityRedisExpireStorage(RedisPriorityQueue, RedisExpireStorage):
+    def enqueue_once(self, key, data, priority=None):
+        script = getattr(self, '_enqueue_once_zset', None)
+        if script is None:
+            script = self.conn.register_script(ENQUEUE_ONCE_KEY_ZSET_LUA)
+            self._enqueue_once_zset = script
+        priority = 0 if priority is None else -priority
+        prefix = struct.pack('>Q', int(time.time() * 1e6))
+        return bool(script(
+            keys=[self.result_key(key), self.queue_key],
+            args=[str(priority), prefix + data, b'1']))
 
 
 class BaseSqlStorage(BaseStorage):
@@ -950,6 +1062,22 @@ class SqliteStorage(BaseSqlStorage):
     def enqueue(self, data, priority=None):
         self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
                  (self.name, self.to_blob(data), priority or 0), commit=True)
+
+    def enqueue_once(self, key, data, priority=None):
+        # The marker row and the queue row are inserted in one transaction, so
+        # a crash can never leave a message without a marker or a marker
+        # without a message.
+        try:
+            with self.db(commit=True) as curs:
+                curs.execute('insert or abort into kv (queue, key, value) '
+                             'values (?, ?, ?)',
+                             (self.name, key, self.to_blob(b'1')))
+                curs.execute('insert into task (queue, data, priority) '
+                             'values (?, ?, ?)',
+                             (self.name, self.to_blob(data), priority or 0))
+        except self.integrity_error:
+            return False
+        return True
 
     def dequeue(self):
         # Quick check without the full exclusive lock.
@@ -1280,6 +1408,20 @@ class PostgresStorage(BaseSqlStorage):
                          (self.name, data, priority or 0))
             curs.execute('select pg_notify(%s, %s)', (self.channel, ''))
 
+    def enqueue_once(self, key, data, priority=None):
+        with self.db(commit=True) as curs:
+            curs.execute('insert into {} (queue, key, value) '
+                         'values (%s, %s, %s) on conflict do nothing'.format(
+                             self.table_kv),
+                         (self.name, self._key(key), b'1'))
+            if curs.rowcount == 0:
+                return False
+            curs.execute('insert into {} (queue, data, priority) '
+                         'values (%s, %s, %s)'.format(self.table_task),
+                         (self.name, data, priority or 0))
+            curs.execute('select pg_notify(%s, %s)', (self.channel, ''))
+        return True
+
     def _dequeue(self):
         with self.db() as curs:
             curs.execute('delete from {t} where id = ('
@@ -1476,29 +1618,43 @@ class FileStorage(BaseStorage):
             os.makedirs(path)
 
     def enqueue(self, data, priority=None):
+        with self.lock:
+            self._enqueue(data, priority)
+
+    def _enqueue(self, data, priority=None):
+        # Enqueue the data. The lock must already be held.
         priority = int(priority or 0)
         if priority < 0: raise ValueError('priority must be a positive number')
         if priority > self.MAX_PRIORITY:
             raise ValueError('priority must be <= %s' % self.MAX_PRIORITY)
 
+        if not os.path.exists(self.queue_path):
+            os.makedirs(self.queue_path)
+
+        # Encode the filename so that tasks are sorted by priority (desc) and
+        # timestamp (asc).
+        prefix = '%04x-%012x' % (
+            self.MAX_PRIORITY - priority,
+            int(time.time() * 1000))
+
+        base = filename = os.path.join(self.queue_path, prefix)
+        conflict = 0
+        while os.path.exists(filename):
+            conflict += 1
+            filename = '%s.%03d' % (base, conflict)
+
+        with open(filename, 'wb') as fh:
+            fh.write(data)
+
+    def enqueue_once(self, key, data, priority=None):
         with self.lock:
-            if not os.path.exists(self.queue_path):
-                os.makedirs(self.queue_path)
-
-            # Encode the filename so that tasks are sorted by priority (desc) and
-            # timestamp (asc).
-            prefix = '%04x-%012x' % (
-                self.MAX_PRIORITY - priority,
-                int(time.time() * 1000))
-
-            base = filename = os.path.join(self.queue_path, prefix)
-            conflict = 0
-            while os.path.exists(filename):
-                conflict += 1
-                filename = '%s.%03d' % (base, conflict)
-
-            with open(filename, 'wb') as fh:
-                fh.write(data)
+            if os.path.exists(self.path_for_key(key)):
+                return False
+            # Claim the marker before writing the queue file, so a process
+            # killed between the two operations can never duplicate delivery.
+            self._put_data(key, b'1')
+            self._enqueue(data, priority)
+            return True
 
     def _get_sorted_filenames(self, path):
         if not os.path.exists(path):

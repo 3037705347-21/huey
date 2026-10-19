@@ -120,6 +120,20 @@ class StorageTests(object):
         self.s.flush_queue()
         self.assertEqual(self.s.queue_size(), 0)
 
+    def test_enqueue_once(self):
+        # The marker makes the enqueue idempotent: only the first call queues
+        # a message.
+        self.assertTrue(self.s.enqueue_once('dedup-1', b'msg-1'))
+        self.assertFalse(self.s.enqueue_once('dedup-1', b'msg-2'))
+        self.assertEqual(self.s.queue_size(), 1)
+        self.assertEqual(self.s.dequeue(), b'msg-1')
+        self.assertTrue(self.s.dequeue() is None)
+        self.assertTrue(self.s.has_data_for_key('dedup-1'))
+
+        # Different markers enqueue independently.
+        self.assertTrue(self.s.enqueue_once('dedup-2', b'msg-3'))
+        self.assertEqual(self.s.dequeue(), b'msg-3')
+
     def test_schedule_methods(self):
         timestamp = datetime.datetime(2000, 1, 2, 3, 4, 5)
         second = datetime.timedelta(seconds=1)

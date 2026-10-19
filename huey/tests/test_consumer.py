@@ -9,6 +9,7 @@ import time
 import unittest
 
 from huey import SqliteHuey
+from huey.api import chord
 from huey.api import crontab
 from huey.consumer import Consumer
 from huey.consumer import Scheduler
@@ -41,6 +42,29 @@ class TestConsumerIntegration(BaseTestCase):
         with self.consumer_context():
             result = task_a(1)
             self.assertEqual(result.get(blocking=True, timeout=2), 2)
+
+    def test_consumer_recovers_interrupted_chord(self):
+        # The members are all done and the aggregation was committed, but the
+        # callback was never delivered before the "restart". A fresh consumer
+        # completes the chord on startup.
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        pending = []
+        self.huey._chord_deliver = lambda *args: pending.append(args)
+        result = self.huey.enqueue(chord([prod.s(1), prod.s(2)], agg.s()))
+        self.execute_next()
+        self.execute_next()
+        self.assertEqual(len(self.huey), 0)
+        del self.huey._chord_deliver
+
+        with self.consumer_context():
+            self.assertEqual(result.get(blocking=True, timeout=5), [2, 3])
 
     def work_on_tasks(self, consumer, n=1, now=None):
         worker, _ = consumer.worker_threads[0]
