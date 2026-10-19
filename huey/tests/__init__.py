@@ -3,6 +3,7 @@ from huey.tests.test_asyncio import *
 from huey.tests.test_consumer import *
 from huey.tests.test_crontab import *
 from huey.tests.test_django_tasks import *
+from huey.tests.test_fairness import *
 from huey.tests.test_helpers import *
 from huey.tests.test_immediate import *
 from huey.tests.test_mini import *

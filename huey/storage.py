@@ -44,8 +44,33 @@ class BaseStorage(object):
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
 
-    def __init__(self, name='huey', **storage_kwargs):
+    def __init__(self, name='huey', fair=False, fair_quota=3,
+                 fair_threshold=0, **storage_kwargs):
         self.name = name
+        self.configure_fairness(fair, fair_quota, fair_threshold)
+
+    def configure_fairness(self, fair=False, fair_quota=3, fair_threshold=0):
+        """
+        Configure the optional fair dequeue mode. When enabled, after every
+        ``fair_quota`` consecutive dequeues of high-priority tasks (priority
+        greater than ``fair_threshold``), the next dequeue is forced to return
+        a waiting low-priority task instead of continuing strict priority
+        order. The rotation state is maintained by the storage backend and
+        updated atomically with each dequeue, so it survives consumer restarts
+        without being over- or under-counted. When disabled (the default)
+        dequeue ordering is unchanged strict priority.
+        """
+        if fair and not self.priority:
+            raise ConfigurationError(
+                'Fair mode requires a storage backend that supports task '
+                'priorities.')
+        fair_quota = int(fair_quota)
+        if fair_quota < 1:
+            raise ConfigurationError(
+                'fair_quota must be a positive integer.')
+        self.fair = bool(fair)
+        self.fair_quota = fair_quota
+        self.fair_threshold = fair_threshold
 
     def close(self):
         """
@@ -336,6 +361,7 @@ class MemoryStorage(BaseStorage):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
         self._queue = []
+        self._fair_streak = 0  # Consecutive high-priority dequeues.
         self._results = {}
         self._expires = {}
         self._schedule = []
@@ -350,12 +376,44 @@ class MemoryStorage(BaseStorage):
 
     def dequeue(self):
         with self._lock:
+            if self.fair:
+                return self._dequeue_fair()
             try:
                 _, _, data = heapq.heappop(self._queue)
             except IndexError:
                 pass
             else:
                 return data
+
+    def _dequeue_fair(self):
+        # The lock must already be held. A high-priority task stored at
+        # ``negpri`` has effective priority ``-negpri``.
+        if self._fair_streak >= self.fair_quota:
+            # Among waiting low-priority tasks, strict order picks the entry
+            # with the smallest (negpri, counter) pair.
+            candidate = None
+            for idx, entry in enumerate(self._queue):
+                if -entry[0] <= self.fair_threshold and (
+                        candidate is None or
+                        (entry[0], entry[1]) <
+                        (candidate[0], candidate[1])):
+                    candidate = (entry[0], entry[1], idx)
+            if candidate is not None:
+                _, _, idx = candidate
+                _, _, data = self._queue.pop(idx)
+                heapq.heapify(self._queue)
+                self._fair_streak = 0
+                return data
+
+        try:
+            negpri, _, data = heapq.heappop(self._queue)
+        except IndexError:
+            return
+        if -negpri > self.fair_threshold:
+            self._fair_streak += 1
+        else:
+            self._fair_streak = 0
+        return data
 
     def queue_size(self):
         return len(self._queue)
@@ -368,6 +426,7 @@ class MemoryStorage(BaseStorage):
 
     def flush_queue(self):
         self._queue = []
+        self._fair_streak = 0
 
     def add_to_schedule(self, data, ts):
         with self._lock:
@@ -464,6 +523,41 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
 end"""
 
 
+# Atomically dequeue a task while updating the fair-rotation streak. The
+# queue is a sorted-set whose score is -priority, so a task is "low" priority
+# when its score is greater than or equal to ARGV[2] (=-fair_threshold).
+# KEYS[1] = queue sorted-set, KEYS[2] = streak counter key.
+# ARGV[1] = fair quota, ARGV[2] = low-priority score boundary.
+FAIR_POP_LUA = """\
+local queue = KEYS[1]
+local streak_key = KEYS[2]
+local quota = tonumber(ARGV[1])
+local low_score = tonumber(ARGV[2])
+local streak = tonumber(redis.call('GET', streak_key) or '0')
+
+if streak >= quota then
+    local lows = redis.call('zrangebyscore', queue, low_score, '+inf',
+                            'LIMIT', 0, 1)
+    if #lows == 1 then
+        redis.call('zrem', queue, lows[1])
+        redis.call('SET', streak_key, '0')
+        return lows[1]
+    end
+end
+
+-- ZPOPMIN returns a flat array of member/score pairs.
+local popped = redis.call('zpopmin', queue, 1)
+if #popped == 0 then return false end
+local member = popped[1]
+local score = tonumber(popped[2])
+if score < low_score then
+    redis.call('SET', streak_key, tostring(streak + 1))
+else
+    redis.call('SET', streak_key, '0')
+end
+return member"""
+
+
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
     redis_client = Redis
@@ -471,7 +565,8 @@ class RedisStorage(BaseStorage):
     def __init__(self, name='huey', blocking=True, read_timeout=1,
                  connection_pool=None, url=None, client_name=None,
                  notify_result=False, notify_result_ttl=60,
-                 clean_name=True, **connection_params):
+                 clean_name=True, fair=False, fair_quota=3,
+                 fair_threshold=0, **connection_params):
 
         if Redis is None:
             raise ConfigurationError('"redis" python module not found, cannot '
@@ -500,10 +595,16 @@ class RedisStorage(BaseStorage):
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
 
         self.name = self.clean_name(name) if clean_name else name
+        self.configure_fairness(fair, fair_quota, fair_threshold)
         self.queue_key = 'huey.redis.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.counter_key = 'huey.counters.%s' % self.name
+        self.fair_key = 'huey.fair.%s' % self.name
+        # Enqueues push a wake-up signal here so blocked fair-mode workers
+        # can wait without removing an item from the queue sorted-set (the
+        # fair pop decision must happen atomically inside FAIR_POP_LUA).
+        self.fair_wake_key = 'huey.fairwake.%s' % self.name
         self.notify_prefix = 'huey.notify.%s.' % self.name
         self.notify_result = notify_result  # Use result notification.
         self.notify_result_ttl = notify_result_ttl
@@ -513,6 +614,8 @@ class RedisStorage(BaseStorage):
 
         self.blocking = blocking
         self.read_timeout = read_timeout
+        self._fair_pop = (self.conn.register_script(FAIR_POP_LUA)
+                          if self.fair else None)
 
     @cached_property
     def redis_version(self):
@@ -579,7 +682,10 @@ class RedisStorage(BaseStorage):
         return self.conn.lrange(self.queue_key, 0, -1)[::-1]
 
     def flush_queue(self):
-        self.conn.delete(self.queue_key)
+        keys = [self.queue_key]
+        if self.fair:
+            keys += [self.fair_key, self.fair_wake_key]
+        self.conn.delete(*keys)
 
     def add_to_schedule(self, data, ts):
         self.conn.zadd(self.schedule_key, {data: self.convert_ts(ts)})
@@ -786,9 +892,20 @@ class RedisPriorityQueue(object):
         # identical messages, except they are enqueued on the same microsecond,
         # from being treated as a single item.
         prefix = struct.pack('>Q', int(time.time() * 1e6))
-        self.conn.zadd(self.queue_key, {prefix + data: priority})
+        member = prefix + data
+        if self.fair:
+            # The wake-up signal is pushed after the queue entry so a worker
+            # waking up always finds the new item on its next fair pop.
+            pipe = self.conn.pipeline()
+            pipe.zadd(self.queue_key, {member: priority})
+            pipe.lpush(self.fair_wake_key, b'1')
+            pipe.execute()
+        else:
+            self.conn.zadd(self.queue_key, {member: priority})
 
     def dequeue(self):
+        if self.fair:
+            return self._fair_dequeue()
         if self.blocking:
             try:
                 # BZPOPMIN returns (key, data, score).
@@ -808,6 +925,38 @@ class RedisPriorityQueue(object):
             items = self.conn.zpopmin(self.queue_key, count=1)
             if items:
                 return items[0][0][8:]  # [(prefix+data, score)].
+
+    def _fair_dequeue(self):
+        # Atomically select the next task (applying fair rotation) and update
+        # the persistent streak counter.
+        args = [self.fair_quota, -self.fair_threshold]
+
+        def pop():
+            item = self._fair_pop(keys=[self.queue_key, self.fair_key],
+                                  args=args)
+            return None if item is None else item[8:]
+
+        if not self.blocking:
+            return pop()
+
+        deadline = time.monotonic() + self.read_timeout
+        while True:
+            item = pop()
+            if item is not None:
+                return item
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                woke = self.conn.blpop(self.fair_wake_key, timeout=remaining)
+            except (TimeoutError, TypeError):
+                return
+            if woke is None:
+                return
+            # Another worker may have consumed the signaled task. Drain any
+            # leftover wake-up signals so an idle worker does not busy-spin.
+            while self.conn.lpop(self.fair_wake_key) is not None:
+                pass
 
     def queue_size(self):
         return self.conn.zcard(self.queue_key)
@@ -876,6 +1025,27 @@ class BaseSqlStorage(BaseStorage):
             for sql in self.ddl:
                 curs.execute(sql)
 
+    def _fair_pick(self, curs, table, streak, qmark='?', lock_clause=''):
+        # Select the next task honoring the fair rotation. Returns the
+        # selected (id, data, priority) row and a flag indicating the row was
+        # forced to be a low-priority task. The caller must already hold any
+        # locks needed to serialize updates to the streak counter.
+        if streak >= self.fair_quota:
+            curs.execute(
+                'select id, data, priority from %s where queue = %s and '
+                'priority <= %s order by priority desc, id limit 1 %s' %
+                (table, qmark, qmark, lock_clause),
+                (self.name, self.fair_threshold))
+            row = curs.fetchone()
+            if row is not None:
+                return row, True
+        curs.execute(
+            'select id, data, priority from %s where queue = %s '
+            'order by priority desc, id limit 1 %s' %
+            (table, qmark, lock_clause),
+            (self.name,))
+        return curs.fetchone(), False
+
     def sql(self, query, params=None, commit=False, results=False):
         with self.db(commit=commit) as curs:
             curs.execute(query, params or ())
@@ -905,12 +1075,16 @@ class SqliteStorage(BaseSqlStorage):
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
                      'primary key(queue, key))')
+    table_fair = ('create table if not exists fair ('
+                  'queue text not null primary key, '
+                  'streak integer not null default 0)')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
-           table_counter, drop_index_task]
+           table_counter, table_fair, drop_index_task]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
-                 create_tables=True, **kwargs):
+                 create_tables=True, fair=False, fair_quota=3,
+                 fair_threshold=0, **kwargs):
         self.filename = filename
         self._cache_mb = cache_mb
         self._fsync = fsync
@@ -933,7 +1107,9 @@ class SqliteStorage(BaseSqlStorage):
 
         self.to_blob = memoryview
 
-        super(SqliteStorage, self).__init__(name, create_tables=create_tables)
+        super(SqliteStorage, self).__init__(
+            name, create_tables=create_tables, fair=fair,
+            fair_quota=fair_quota, fair_threshold=fair_threshold)
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -958,6 +1134,8 @@ class SqliteStorage(BaseSqlStorage):
             return
 
         with self.db(commit=True) as curs:
+            if self.fair:
+                return self._dequeue_fair(curs)
             curs.execute('select id, data from task where queue = ? '
                          'order by priority desc, id limit 1', (self.name,))
             result = curs.fetchone()
@@ -966,6 +1144,26 @@ class SqliteStorage(BaseSqlStorage):
                 curs.execute('delete from task where id = ?', (tid,))
                 if curs.rowcount == 1:
                     return data
+
+    def _dequeue_fair(self, curs):
+        curs.execute('insert or ignore into fair (queue, streak) '
+                     'values (?, 0)', (self.name,))
+        curs.execute('select streak from fair where queue = ?', (self.name,))
+        streak, = curs.fetchone()
+
+        row, forced = self._fair_pick(curs, 'task', streak)
+        if row is None:
+            return
+        tid, data, priority = row
+        curs.execute('delete from task where id = ?', (tid,))
+        if curs.rowcount == 1:
+            if forced or priority <= self.fair_threshold:
+                new_streak = 0
+            else:
+                new_streak = streak + 1
+            curs.execute('update fair set streak = ? where queue = ?',
+                         (new_streak, self.name))
+            return data
 
     def queue_size(self):
         return self.sql('select count(id) from task where queue=?',
@@ -982,6 +1180,9 @@ class SqliteStorage(BaseSqlStorage):
 
     def flush_queue(self):
         self.sql('delete from task where queue=?', (self.name,), commit=True)
+        if self.fair:
+            self.sql('delete from fair where queue=?', (self.name,),
+                     commit=True)
 
     def add_to_schedule(self, data, ts):
         params = (self.name, self.to_blob(data), ts.timestamp())
@@ -1155,6 +1356,7 @@ class CySqliteStorage(SqliteStorage):
 class PostgresStorage(BaseSqlStorage):
     def __init__(self, name='huey', dsn=None, connection=None, blocking=True,
                  read_timeout=1, table_prefix='huey', create_tables=True,
+                 fair=False, fair_quota=3, fair_threshold=0,
                  **connection_params):
         if psycopg is None:
             raise ConfigurationError('"psycopg" (version 3.2 or newer) not '
@@ -1172,6 +1374,7 @@ class PostgresStorage(BaseSqlStorage):
         self.table_schedule = prefix + '_schedule'
         self.table_task = prefix + '_task'
         self.table_counter = prefix + '_counter'
+        self.table_fair = prefix + '_fair'
 
         # Postgres channel names longer than 63 bytes raise "channel name
         # too long" from pg_notify(), which would break every enqueue.
@@ -1203,7 +1406,11 @@ class PostgresStorage(BaseSqlStorage):
 
             'create table if not exists {p}_counter ('
             'queue text not null, key text not null, '
-            'value bigint not null default 0, primary key(queue, key))')]
+            'value bigint not null default 0, primary key(queue, key))',
+
+            'create table if not exists {p}_fair ('
+            'queue text not null primary key, '
+            'streak bigint not null default 0)')]
 
         # Do not reuse conns across fork!
         self._inherited = []
@@ -1215,7 +1422,9 @@ class PostgresStorage(BaseSqlStorage):
         # this is safe on both sides of a fork.
         self._listen_local = threading.local()
 
-        super(PostgresStorage, self).__init__(name, create_tables=create_tables)
+        super(PostgresStorage, self).__init__(
+            name, create_tables=create_tables, fair=fair,
+            fair_quota=fair_quota, fair_threshold=fair_threshold)
 
     def _connect(self):
         if self.connection is not None:
@@ -1281,6 +1490,8 @@ class PostgresStorage(BaseSqlStorage):
             curs.execute('select pg_notify(%s, %s)', (self.channel, ''))
 
     def _dequeue(self):
+        if self.fair:
+            return self._dequeue_fair()
         with self.db() as curs:
             curs.execute('delete from {t} where id = ('
                          'select id from {t} where queue = %s '
@@ -1291,6 +1502,33 @@ class PostgresStorage(BaseSqlStorage):
             row = curs.fetchone()
         if row is not None:
             return bytes(row[0])
+
+    def _dequeue_fair(self):
+        t, f = self.table_task, self.table_fair
+        with self.db(commit=True) as curs:
+            curs.execute(
+                'insert into {f} (queue, streak) values (%s, 0) '
+                'on conflict do nothing'.format(f=f), (self.name,))
+            # Locking the streak row serializes fair-rotation decisions
+            # between independent worker connections.
+            curs.execute('select streak from {f} where queue = %s '
+                         'for update'.format(f=f), (self.name,))
+            streak, = curs.fetchone()
+
+            row, forced = self._fair_pick(
+                curs, t, streak, qmark='%s',
+                lock_clause='for update skip locked')
+            if row is None:
+                return
+            tid, data, priority = row
+            curs.execute('delete from {t} where id = %s'.format(t=t), (tid,))
+            if forced or priority <= self.fair_threshold:
+                new_streak = 0
+            else:
+                new_streak = streak + 1
+            curs.execute('update {f} set streak = %s where queue = %s'.format(
+                f=f), (new_streak, self.name))
+        return bytes(data)
 
     def dequeue(self):
         data = self._dequeue()
@@ -1326,6 +1564,9 @@ class PostgresStorage(BaseSqlStorage):
     def flush_queue(self):
         self.sql('delete from {} where queue = %s'.format(self.table_task),
                  (self.name,))
+        if self.fair:
+            self.sql('delete from {} where queue = %s'.format(
+                self.table_fair), (self.name,))
 
     def add_to_schedule(self, data, ts):
         self.sql('insert into {} (queue, data, timestamp) '
@@ -1505,19 +1746,62 @@ class FileStorage(BaseStorage):
             return ()
         return [f for f in sorted(os.listdir(path)) if not f.endswith('.tmp')]
 
+    def _filename_priority(self, filename):
+        return self.MAX_PRIORITY - int(filename[:4], 16)
+
+    def _fair_state_path(self):
+        return os.path.join(self.path, '.fair-%s' % self.name)
+
+    def _read_fair_streak(self):
+        try:
+            with open(self._fair_state_path(), 'rt') as fh:
+                return int(fh.read().strip())
+        except (OSError, ValueError):
+            return 0
+
+    def _write_fair_streak(self, value):
+        state_path = self._fair_state_path()
+        tmp_path = state_path + '.tmp'
+        with open(tmp_path, 'wt') as fh:
+            fh.write(str(value))
+        os.replace(tmp_path, state_path)
+
     def dequeue(self):
         with self.lock:
             filenames = self._get_sorted_filenames(self.queue_path)
             if not filenames:
                 return
 
-            filename = os.path.join(self.queue_path, filenames[0])
+            index = 0
+            new_streak = None
+            if self.fair:
+                streak = self._read_fair_streak()
+                if streak >= self.fair_quota:
+                    for i, name in enumerate(filenames):
+                        if (self._filename_priority(name) <=
+                                self.fair_threshold):
+                            index = i
+                            new_streak = 0
+                            break
+
+            filename = os.path.join(self.queue_path, filenames[index])
             tmp_dest = filename + '.tmp'
             os.rename(filename, tmp_dest)
 
             with open(tmp_dest, 'rb') as fh:
                 data = fh.read()
             os.unlink(tmp_dest)
+
+            if self.fair:
+                if new_streak is None:
+                    priority = self._filename_priority(filenames[index])
+                    if priority > self.fair_threshold:
+                        new_streak = streak + 1
+                    else:
+                        new_streak = 0
+                # Persisted within the same lock that removed the task, so a
+                # crash cannot dequeue a task without recording the rotation.
+                self._write_fair_streak(new_streak)
         return data
 
     def queue_size(self):
@@ -1533,6 +1817,11 @@ class FileStorage(BaseStorage):
 
     def flush_queue(self):
         self._flush_dir(self.queue_path)
+        if self.fair:
+            try:
+                os.unlink(self._fair_state_path())
+            except OSError:
+                pass
 
     def _timestamp_to_prefix(self, ts):
         ts = time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
